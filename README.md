@@ -1,1 +1,1 @@
-# forecasting_webinar
+# forecasting_meetup
