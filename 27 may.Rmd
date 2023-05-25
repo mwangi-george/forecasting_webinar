@@ -1,0 +1,631 @@
+---
+title: "Datasets"
+author: "Mwangi N. George"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# printing options
+options(scipen = 999)
+
+# Libraries
+pacman::p_load(
+   lubridate,     # date time functions
+   trelliscopejs, # scaling up data visualization to several facets 
+   timetk,        # time series data wrangling and Visualization
+   
+   # ecosystems 
+   tidyverse,     # basic data preprocessing, manipulation, and visualization
+   modeltime,     # Tidy time series forecasting with tidymodels.
+   tidymodels     # Machine Learning
+  )
+```
+
+# Data source
+
+We will track historical number of patients presenting with Influenza-like Illnesses each week by region and year in the United states.
+
+```{r}
+# data source
+# https://gis.cdc.gov/grasp/fluview/fluportaldashboard.html
+# 
+sentinel <- data.table::fread("data/sentinel.csv", header = T) %>%
+  as_tibble() %>% 
+  janitor::clean_names()
+```
+
+# Some Exploratory Analysis
+
+```{r}
+glimpse(sentinel)
+
+# Check duplicates
+sentinel %>% distinct()
+
+sentinel %>% count(region)
+
+sentinel %>% count(year)
+
+sentinel %>% count(week)
+
+sentinel %>% 
+  filter(week == 53)
+
+sentinel %>% 
+  select(region, year,week,total_patients) %>% 
+  filter(total_patients != "X") %>% 
+  mutate(total_patients = as.numeric(total_patients)) -> sentinel_1
+```
+
+# Create date feature
+```{r}
+sentinel_1 %>% filter(region == "Alabama") %>% nrow()
+
+# Start from the 40th week of 2010
+start_date <- ymd("2010-10-04")  
+
+# Add 657 weeks to the start date
+end_date <- start_date + weeks(657)          
+
+dates <- seq(start_date, end_date, by = "7 days")  # Generate a sequence of dates
+
+length(dates)
+```
+
+
+# I will narrow my analysis to 5 regions for demonstration purposes 
+```{r}
+sentinel_1 %>% 
+  filter(region %in% c("Alabama", "California", "Montana", "Delaware", "Georgia")) %>% 
+  arrange(year, week) %>% 
+  group_by(region) %>% 
+  mutate(date = dates) %>% 
+  ungroup() -> sentinel_2
+```
+
+
+# Visualizing trends
+```{r}
+# by region and year
+sentinel_2 %>% 
+  group_by(region, year) %>% 
+  plot_time_series(
+    .date_var = date, 
+    .value = total_patients,
+    .interactive = F, 
+    .title = "Total Patients with ILI over time"
+    )+
+  geom_point()+
+  facet_trelliscope(~region + year, scales = "free", width = 1000, as_plotly = T)
+```
+
+
+```{r}
+# by region
+sentinel_2 %>% 
+  group_by(region) %>% 
+  plot_time_series(
+    date, total_patients, .interactive = F,
+    .title = "Total Patients with ILI over time"
+    )+
+  geom_point()+
+  facet_trelliscope(~ region, scales = "free", width = 1000, as_plotly = T)
+```
+
+
+# Outlier Detection
+```{r}
+# by region
+sentinel_2 %>% 
+  group_by(region) %>% 
+  plot_anomaly_diagnostics(
+    date, total_patients, .interactive = F,
+    .title = "Total Patients with ILI over time"
+    )+
+  geom_point()+
+  facet_trelliscope(~ region, scales = "free", width = 1000, as_plotly = T)
+```
+
+
+# Handling Outliers
+```{r message=FALSE}
+outliers <- sentinel_2 %>% 
+  group_by(region) %>% 
+  tk_anomaly_diagnostics(date, total_patients) %>% 
+  filter(anomaly == "Yes") %>% 
+  select(region, date, trend_value = trend)
+```
+
+```{r}
+sentinel_2 %>%
+  full_join(outliers, by = c("region", "date")) %>%
+  mutate(
+    total_patients = case_when(
+      !is.na(trend_value) ~ trend_value,
+      T~ total_patients
+      )
+    ) %>% 
+  select(region, date, total_patients) -> sentinel_3
+  
+# visualize to confirm 
+sentinel_3 %>% 
+  group_by(region) %>% 
+  plot_anomaly_diagnostics(
+    date, total_patients, .interactive = F,
+    .title = "Total Patients for ILI over time"
+    )+
+  geom_point()+
+  facet_trelliscope(~ region, scales = "free", width = 1000, as_plotly = T)
+```
+
+```{r}
+outliers_2 <- sentinel_3 %>% 
+  group_by(region) %>% 
+  tk_anomaly_diagnostics(date, total_patients) %>% 
+  filter(anomaly == "Yes") %>% 
+  select(region, date, trend_value = trend)
+```
+
+```{r}
+sentinel_3 %>%
+  full_join(outliers_2, by = c("region", "date")) %>%
+  mutate(
+    total_patients.x = case_when(
+      !is.na(trend_value) ~ trend_value,
+      T~ total_patients
+      )
+    ) %>% 
+  select(region, date, total_patients) -> sentinel_4
+  
+
+sentinel_4 %>% 
+  group_by(region) %>% 
+  plot_anomaly_diagnostics(date, total_patients, .interactive = F)+
+  geom_point()+
+  facet_trelliscope(~ region, scales = "free", width = 1000, as_plotly = T)
+```
+
+
+# Forecasting Workflow
+# Basics - Fit a linear model
+```{r, fig.width=14, fig.height=14}
+sentinel_4 %>% 
+  group_by(region) %>% 
+  plot_time_series_regression(
+    date, .formula = total_patients ~ date, .facet_ncol = 1, .show_summary = T
+    )
+```
+# Extend the time series into the future
+```{r}
+extended_df <- sentinel_4 %>% 
+  extend_timeseries(.id_var = region, .date_var = date, .length_future = 52*5)
+
+tail(extended_df)
+```
+
+# Visualize the area we want to forecast
+```{r}
+extended_df %>% 
+  group_by(region) %>% 
+  plot_time_series(date, total_patients, .interactive = F)+
+  naniar::geom_miss_point(alpha = .7)+
+  facet_trelliscope(~region, scales = "free")
+```
+
+# Nesting the time series groups
+```{r}
+nested_df <- extended_df %>% 
+  nest_timeseries(.id_var = region, .length_future = 52*5, .length_actual = 52*4) %>% 
+  split_nested_timeseries(.length_test = 52)
+
+train <- extract_nested_train_split(nested_df)
+test <- extract_nested_test_split(nested_df)
+
+```
+
+# Let's make some models using functions from modeltime and parsnip.
+
+## Automatic Models
+
+Are modeling approaches that have been automated. Examples include "Auto ARIMA" and "Auto ETS" 
+
+### Auto ARIMA
+
+All modeltime models require a date column to be a regressor.
+```{r}
+model_fit_arima <- arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(total_patients ~ date, train)
+
+model_fit_arima
+```
+
+The acronym ARIMA stands for "Autoregressive Integrated Moving Average." The three numbers in parentheses (0,1,3) refer to the orders of the autoregressive, integrated, and moving average components of the model, respectively.
+
+The "drift" term in this model refers to a constant that is added to the model's equation, allowing for a non-zero mean in the time series. This drift term is typically included in ARIMA models when the data exhibits a trend or a systematic increase or decrease over time.
+
+In summary, an ARIMA(0,1,3) with drift model assumes that the current value of the time series depends on the three most recent values, with a first-order differencing operator applied to the series, and a drift term added to account for any trend or systematic change in the mean of the series over time.
+
+### Prophet
+
+```{r}
+model_fit_prophet <- prophet_reg(seasonality_yearly = TRUE) %>%
+  set_engine("prophet") %>%
+  fit(total_patients ~ date, train)
+
+model_fit_prophet
+```
+
+## Machine Learning Models
+
+Machine learning models are more complex than the automated models and therefore requires a workflow.
+
+*The Fourier series approach involves fitting a model to the time series that incorporates multiple sine and cosine functions of different frequencies, known as harmonics. The amplitude and phase of each harmonic are estimated using historical data. This allows the model to capture any cyclic patterns or seasonality in the time series, which can then be used to make future forecasts. The Fourier series approach is particularly useful for seasonal time series, where the patterns repeat on a regular basis. By decomposing the series into its constituent frequencies, the method can capture the seasonality more accurately than traditional methods such as exponential smoothing or ARIMA models.*
+
+```{r}
+
+recipe_spec <- recipe(total_patients ~ date, train) %>%
+  # add feature engineering steps
+  step_timeseries_signature(date) %>%
+  step_rm(
+    contains("am.pm"), contains("hour"), contains("minute"),
+    contains("second"), contains("xts")
+    ) %>%
+  step_fourier(date, period = 365, K = 5) %>%
+  step_dummy(all_nominal_predictors())
+
+recipe_spec %>% prep() %>% juice()
+```
+
+With a recipe in-hand, we can set up our machine learning pipelines.
+
+### Elastic Net
+```{r}
+model_spec_glmnet <- linear_reg() %>%
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+model_spec_glmnet
+```
+
+
+Create a fitted workflow
+```{r}
+workflow_fit_glmnet <- workflow() %>%
+  add_model(model_spec_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>% # Note that I’m removing the “date” column since Machine Learning algorithms don’t typically know how to deal with date or date-time features)
+  fit(train)
+
+workflow_fit_glmnet
+```
+
+### Random Forest
+
+```{r}
+model_spec_rf <- rand_forest() %>%
+  set_mode("regression") %>% 
+  set_engine("randomForest")
+
+workflow_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>% 
+  fit(train)
+
+workflow_fit_rf
+```
+
+## Hybrid ML Models
+Automation + Machine Learning. Examples include arima_boost() and prophet_boost(). 
+
+### Prophet Boost
+```{r}
+model_spec_prophet_boost <- prophet_boost(seasonality_yearly = TRUE) %>%
+  set_mode("regression") %>% 
+  set_engine("prophet_xgboost") 
+
+workflow_fit_prophet_boost <- workflow() %>%
+  add_model(model_spec_prophet_boost) %>%
+  add_recipe(recipe_spec) %>%
+  fit(train)
+
+workflow_fit_prophet_boost
+```
+
+
+* Others advanced algorithms include SVM, XGBoost, Decision tree
+
+
+# The Modeltime Workflow
+
+The **modeltime workflow** speeds up **model evaluation** and **selection**. 
+
+## Modeltime Table
+
+Fits the  workflow objects to the nested time series data 
+```{r message=FALSE}
+model_table <- modeltime_nested_fit(
+  
+  # start with the nested time series data
+  nested_data = nested_df, 
+  
+  # specify models and workflows
+  model_fit_arima, 
+  model_fit_prophet,
+  workflow_fit_glmnet,
+  workflow_fit_rf,
+  workflow_fit_prophet_boost,
+  
+  # control Parallel processing and verbosity
+  control = control_nested_fit(verbose = T)
+) 
+
+model_table
+```
+
+# Error Report for any model that returned an error
+```{r}
+model_table %>% 
+  extract_nested_error_report()
+```
+
+# Accuracy Metrics calculated on the testing splits 
+```{r}
+model_table %>% 
+  extract_nested_test_accuracy() %>% 
+  group_by(region) %>% 
+  table_modeltime_accuracy()
+```
+
+# Visualize the predictions on the testing splits
+```{r}
+model_table %>% 
+  extract_nested_test_forecast()%>% 
+  group_by(region) %>% 
+  plot_modeltime_forecast(.interactive = F)+
+  facet_trelliscope(~region, as_plotly = T, scales = "free", width = 1000)
+```
+
+# Select the best models for each time series group in the Nested Modeltime
+```{r}
+best_model <- model_table %>% 
+  modeltime_nested_select_best(metric = "rmse", minimize = T)
+```
+
+# Refit the Nested Modeltime Table to actual data using the best models 
+```{r}
+best_model_refit <- best_model %>% 
+  modeltime_nested_refit(
+    control = control_nested_refit(verbose = T)
+  )
+```
+
+# Forecast the future
+```{r}
+best_model_refit %>% 
+  extract_nested_future_forecast() %>% 
+  group_by(region) %>% 
+  plot_modeltime_forecast(.interactive = F, .color_lab = .model_desc)+
+  facet_trelliscope(~ region, scales = "free", width = 1000, as_plotly = T)
+```
+
+# What this session didn't cover.
+
+## Incorporating other variables in the orginal data sets in the models
+## Forecasting for all the time series groups
+## Hyperparameter tuning
+
+
+```{r}
+# load libraries
+
+pacman::p_load(
+  forecast, tsibble, gt, tidyverse, prophet, shiny, shinydashboard, tsibble,
+  plotly, lubridate, DT, dashboardthemes, shinythemes, janitor, shinymanager
+)
+
+# convert data to tsibble object
+service_data_prepared <- sentinel_4 %>% 
+  rename(ds = date, y = total_patients) 
+
+
+
+# my secure User Interface
+ui <- secure_app(
+  dashboardPage(
+    skin = "purple",
+    dashboardHeader(
+      title = "Forecasting App",
+      titleWidth = 300
+    ),
+    dashboardSidebar(
+      width = 300,
+      selectInput("region", "Select Region:",
+                  choices = unique(service_data_prepared$region),
+                  selected = "Alabama" 
+      ),selectInput(
+        "seasonality", "Indicate Whether to Reflect Seasonality",
+        choices = c(Yes = T, No = F), selected = "Yes"
+      ),
+      selectInput(
+        "growth", "Indicate the Growth Type of Forecasts",
+        choices = c(Linear = "linear", Flat = "flat"), selected = "Linear"
+      ),
+      sliderInput("horizon", "Forecast Horizon (Weeks):",
+                  min = 1, max = 52*5, value = 52*3
+      ),
+      br(),
+      actionButton("goButton", "Run Forecast",
+                   icon = icon("gear", lib = "font-awesome"), 
+                   style = "color: #fff; background-color: purple; border-color: purple")
+    ),
+    dashboardBody(
+      tabsetPanel(
+        tabPanel("Annual Quantity Forecasting",
+                 fluidRow(
+                   box(gt_output("table2"), width = 12)
+                 ),
+                 icon = icon("bars", lib = "font-awesome")
+        ),
+        tabPanel("Monthly Quantity Forecasts",
+                 fluidRow(
+                   box(gt_output("table1"), width = 12)
+                 ),
+                 icon = icon("list", lib = "font-awesome")
+        ),
+        tabPanel("Forecast Plot",
+                 fluidRow(
+                   box(plotlyOutput("plot1", height = 500, width = "100%"), width = 12)
+                 ),
+                 icon = icon("chart-line", lib = "font-awesome")
+        )
+      )
+    )
+  )
+)
+
+
+
+# Server Code
+server <- function(input, output, session) {
+  
+  # check_credentials returns a function to authenticate users
+  res_auth <- secure_server(
+    check_credentials = check_credentials(credentials)
+  )
+  
+  
+  # define some credentials
+  credentials <- data.frame(
+    # mandatory
+    user = c(
+      "demo"
+    ),
+    password = "george" # mandatory
+  )
+  
+  
+  # reactive data
+  data <- reactive({
+    service_data_prepared %>% filter(region == input$region)
+  })
+  
+  # reactive forecast
+  forecast_data <- eventReactive(input$goButton, {
+    if (nrow(data()) >= 2) {
+      fit <- prophet(
+        data(), 
+        growth = input$growth, 
+        seasonality.mode = "multiplicative", 
+        yearly.seasonality = input$seasonality
+        )
+      future <- make_future_dataframe(
+        fit, periods = input$horizon, 
+        freq = "1 week", include_history = T
+        )
+      last_date <- tail(data()$ds, n = 1)
+      future <- future %>% filter(ds > last_date)
+      forecast <- predict(fit, future)
+      return(forecast)
+    } else {
+      NULL
+    }
+  })
+  
+  # plot forecast
+  output$plot1 <- renderPlotly({
+    if (!is.null(forecast_data())) {
+      plot_ly() %>%
+        add_trace(
+          data = data(), x = ~ds, y = ~y, type = "scatter",
+          mode = "lines+markers", name = "Actual Data",
+          line = list(color = "black"), marker = list(color = "black", size = 5)
+        ) %>%
+        add_trace(
+          data = forecast_data(), x = ~ds, y = ~yhat,
+          type = "scatter", mode = "lines+markers", line = list(color = "green"),
+          marker = list(color = "green", size = 5), name = "Forecast"
+        ) %>%
+        add_ribbons(
+          data = forecast_data(), x = ~ds, ymin = ~yhat_lower, ymax = ~yhat_upper,
+          fillcolor = "gray95", line = list(color = "transparent"), name = "Forecast Interval"
+        ) %>%
+        layout(
+          title = str_c("Total Patients with ILI", input$region,  sep = " "),
+          xaxis = list(title = "Date"), yaxis = list(title = input$region)
+        )
+    }
+  })
+  
+  # display forecast data in a table
+  output$table1 <- render_gt({
+    if (!is.null(forecast_data())) {
+      forecast_data() %>%
+        select(Date = ds, Forecast = yhat, Lower = yhat_lower, Upper = yhat_upper) %>%
+        mutate(" " = " ") %>% 
+        relocate(" ") %>% 
+        adorn_totals("row",fill = "Total") %>% 
+        mutate(
+          Date = as.Date(Date),
+          Date = yearmonth(Date),
+          Forecast = format(round(Forecast), big.mark = ", "),
+          Lower = format(round(Lower), big.mark = ", "),
+          Upper = format(round(Upper), big.mark = ", ")
+        ) %>% 
+        gt() %>% 
+        tab_header(
+          title = "Monthly Forecast for the Selected Data",
+          subtitle = input$region
+        ) %>% 
+        # opt_stylize(style = 6, color = "red") %>% 
+        tab_options(
+          table.width = pct(100), ihtml.active = T,
+          heading.background.color = "purple"
+        )
+    }
+  })
+  
+  # display forecast data summaries in a table
+  output$table2 <- render_gt({
+    if (!is.null(forecast_data())) {
+      forecast_data() %>%
+        select(Date = ds, Forecast = yhat, Lower = yhat_lower, Upper = yhat_upper) %>%
+        mutate(
+          financial_year = case_when(
+            between(Date, as.Date("2023-07-01"), as.Date("2024-06-01")) ~ "FY2023/24",
+            between(Date, as.Date("2024-07-01"), as.Date("2025-06-01")) ~ "FY2024/25",
+            between(Date, as.Date("2025-07-01"), as.Date("2026-06-01")) ~ "FY2025/26",
+            TRUE ~ "unwanted"
+          )
+        ) %>% 
+        filter(financial_year != "unwanted") %>% 
+        group_by(financial_year) %>%
+        summarise(`Predicted Dispensed Value` = round(sum(Forecast))) %>%
+        mutate(
+          `Predicted Dispensed Value` = format(`Predicted Dispensed Value`, big.mark = ",")
+          ) %>%
+        rename(
+          `Financial Year`= financial_year,
+          `Predicted Value` = `Predicted Dispensed Value`
+          ) %>% 
+        gt() %>% 
+        tab_header(
+          title = "Forecast Summary for the next 3 Financial Years",
+          subtitle = input$region
+        ) %>%
+        tab_options(
+          table.width = pct(100), ihtml.active = T,
+          heading.background.color = "purple"
+        )
+    }
+  })
+  
+}
+
+# Run the application
+shinyApp(ui, server)
+```
